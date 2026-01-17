@@ -26,7 +26,13 @@ class PlaidCategoryMapping(models.Model):
     account_id = fields.Many2one(
         comodel_name="account.account",
         string="Expense Account",
-        domain="[('account_type', 'in', ['expense', 'expense_depreciation', 'expense_direct_cost'])]",
+        domain=[
+            (
+                "account_type",
+                "in",
+                ["expense", "expense_depreciation", "expense_direct_cost"],
+            )
+        ],
         help="Account to use for automatic categorization of transactions",
     )
     company_id = fields.Many2one(

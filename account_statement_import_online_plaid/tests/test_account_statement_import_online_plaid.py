@@ -1,8 +1,12 @@
 # Copyright 2025 Kencove
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
+import hashlib
+import time
 from datetime import date, datetime
 from unittest import mock
+
+from psycopg2 import IntegrityError
 
 from odoo import fields
 from odoo.exceptions import UserError
@@ -14,6 +18,7 @@ _provider_class = (
     + ".models.online_bank_statement_provider_plaid"
     + ".OnlineBankStatementProviderPlaid"
 )
+_controller_class = _module_ns + ".controllers.plaid_callback"
 
 
 class MockPlaidTransaction:
@@ -95,13 +100,21 @@ class TestAccountBankStatementImportOnlinePlaid(common.TransactionCase):
 
     def test_connection_status_disconnected(self):
         """Test connection status when not connected"""
-        provider = self.provider.copy(
+        # Clear connection fields to test disconnected status
+        self.provider.write(
             {
                 "plaid_access_token": False,
                 "plaid_account_id": False,
             }
         )
-        self.assertEqual(provider.plaid_connection_status, "disconnected")
+        self.assertEqual(self.provider.plaid_connection_status, "disconnected")
+        # Restore for other tests
+        self.provider.write(
+            {
+                "plaid_access_token": "test_access_token",
+                "plaid_account_id": "acct-123",
+            }
+        )
 
     def test_connection_status_connected(self):
         """Test connection status when connected"""
@@ -157,7 +170,7 @@ class TestAccountBankStatementImportOnlinePlaid(common.TransactionCase):
 
     def test_category_mapping(self):
         """Test that Plaid categories are mapped to accounts"""
-        # Create a category mapping
+        # Find an expense account to use for mapping
         account = self.env["account.account"].search(
             [
                 ("account_type", "=", "expense"),
@@ -167,22 +180,36 @@ class TestAccountBankStatementImportOnlinePlaid(common.TransactionCase):
         )
 
         if account:
-            self.env["plaid.category.mapping"].create(
-                {
-                    "name": "Test Category",
-                    "plaid_category": "FOOD_AND_DRINK",
-                    "account_id": account.id,
-                }
+            # Update the existing FOOD_AND_DRINK mapping (created via data XML)
+            # instead of creating a new one to avoid unique constraint violation
+            mapping = self.env["plaid.category.mapping"].search(
+                [("plaid_category", "=", "FOOD_AND_DRINK")],
+                limit=1,
             )
+            if mapping:
+                mapping.account_id = account
+            else:
+                # Fallback: create if somehow it doesn't exist
+                mapping = self.env["plaid.category.mapping"].create(
+                    {
+                        "name": "Test Category",
+                        "plaid_category": "FOOD_AND_DRINK",
+                        "account_id": account.id,
+                        "company_id": False,
+                    }
+                )
+
+            # Create a proper mock for personal_finance_category
+            # Note: MagicMock(attr=value) doesn't set attributes, we need to do it explicitly
+            category_mock = mock.MagicMock()
+            category_mock.primary = "FOOD_AND_DRINK"
+            category_mock.detailed = "FOOD_AND_DRINK_RESTAURANTS"
 
             transaction = MockPlaidTransaction(
                 transaction_id="txn-food",
                 amount=25.0,
                 name="Restaurant",
-                personal_finance_category=mock.MagicMock(
-                    primary="FOOD_AND_DRINK",
-                    detailed="FOOD_AND_DRINK_RESTAURANTS",
-                ),
+                personal_finance_category=category_mock,
             )
 
             line = self.provider._plaid_transaction_to_line(transaction)
@@ -191,17 +218,18 @@ class TestAccountBankStatementImportOnlinePlaid(common.TransactionCase):
 
     def test_obtain_statement_data_not_connected(self):
         """Test error when trying to sync without connection"""
-        provider = self.provider.copy(
-            {
-                "plaid_access_token": False,
-            }
-        )
+        # Temporarily clear access token
+        original_token = self.provider.plaid_access_token
+        self.provider.plaid_access_token = False
 
         with self.assertRaises(UserError):
-            provider._plaid_obtain_statement_data(
+            self.provider._plaid_obtain_statement_data(
                 datetime(2024, 1, 1),
                 datetime(2024, 1, 31),
             )
+
+        # Restore for other tests
+        self.provider.plaid_access_token = original_token
 
     def mock_plaid_get_transactions(self):
         """Create mock for _plaid_get_transactions"""
@@ -305,17 +333,223 @@ class TestPlaidCategoryMapping(common.TransactionCase):
 
     def test_category_mapping_unique_constraint(self):
         """Test that duplicate mappings are prevented"""
+        # Unique constraint: (plaid_category, plaid_category_detailed, company_id)
+        # PostgreSQL doesn't consider two NULLs equal, so set plaid_category_detailed
         self.env["plaid.category.mapping"].create(
             {
                 "name": "Travel 1",
                 "plaid_category": "TRAVEL",
+                "plaid_category_detailed": "TRAVEL_FLIGHTS",
             }
         )
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(IntegrityError):
             self.env["plaid.category.mapping"].create(
                 {
                     "name": "Travel 2",
                     "plaid_category": "TRAVEL",
+                    "plaid_category_detailed": "TRAVEL_FLIGHTS",
                 }
             )
+
+
+class TestPlaidWebhookVerification(common.TransactionCase):
+    """Tests for Plaid webhook signature verification"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Import controller for testing (use relative import per OCA guidelines)
+        from ..controllers.plaid_callback import PlaidController
+
+        cls.controller = PlaidController()
+
+        # Create a provider for testing
+        cls.currency_usd = cls.env.ref("base.USD")
+        cls.currency_usd.write({"active": True})
+
+        cls.bank_account = cls.env["res.partner.bank"].create(
+            {
+                "acc_number": "987654321",
+                "partner_id": cls.env.company.partner_id.id,
+            }
+        )
+
+        cls.journal = cls.env["account.journal"].create(
+            {
+                "name": "Plaid Webhook Test",
+                "type": "bank",
+                "code": "PLWH",
+                "currency_id": cls.currency_usd.id,
+                "bank_statements_source": "online",
+                "online_bank_statement_provider": "plaid",
+                "bank_account_id": cls.bank_account.id,
+            }
+        )
+
+        cls.provider = cls.journal.online_bank_statement_provider_id
+        cls.provider.write(
+            {
+                "plaid_client_id": "test_client_id",
+                "plaid_secret": "test_secret",
+                "plaid_environment": "sandbox",
+                "plaid_access_token": "test_access_token",
+                "plaid_item_id": "webhook_test_item",
+                "plaid_account_id": "acct-webhook",
+            }
+        )
+
+    def test_webhook_verification_missing_header(self):
+        """Test that webhook is rejected when Plaid-Verification header is missing"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+        headers = {}  # No Plaid-Verification header
+
+        # Mock JOSE_AVAILABLE to True to test verification logic
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", True):
+            result = self.controller._verify_plaid_webhook(body, headers, self.provider)
+
+        self.assertFalse(result)
+
+    def test_webhook_verification_invalid_algorithm(self):
+        """Test that webhook is rejected with non-ES256 algorithm"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+
+        # Mock JWT with wrong algorithm
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", True), mock.patch(
+            _controller_class + ".jwt"
+        ) as mock_jwt:
+            mock_jwt.get_unverified_header.return_value = {
+                "alg": "RS256",  # Wrong algorithm
+                "kid": "test-key-id",
+            }
+
+            headers = {"Plaid-Verification": "fake.jwt.token"}
+            result = self.controller._verify_plaid_webhook(body, headers, self.provider)
+
+        self.assertFalse(result)
+
+    def test_webhook_verification_expired(self):
+        """Test that webhook is rejected when too old (> 5 minutes)"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+        body_hash = hashlib.sha256(body.encode()).hexdigest()
+
+        # Mock JWT with old timestamp
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", True), mock.patch(
+            _controller_class + ".jwt"
+        ) as mock_jwt:
+            mock_jwt.get_unverified_header.return_value = {
+                "alg": "ES256",
+                "kid": "test-key-id",
+            }
+            # IAT is 10 minutes ago (too old)
+            mock_jwt.decode.return_value = {
+                "iat": time.time() - 600,
+                "request_body_sha256": body_hash,
+            }
+
+            # Mock key retrieval
+            with mock.patch.object(
+                self.controller,
+                "_get_webhook_verification_key",
+                return_value={"expired_at": None, "key": "fake-key"},
+            ):
+                headers = {"Plaid-Verification": "fake.jwt.token"}
+                result = self.controller._verify_plaid_webhook(
+                    body, headers, self.provider
+                )
+
+        self.assertFalse(result)
+
+    def test_webhook_verification_body_hash_mismatch(self):
+        """Test that webhook is rejected when body hash doesn't match"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", True), mock.patch(
+            _controller_class + ".jwt"
+        ) as mock_jwt:
+            mock_jwt.get_unverified_header.return_value = {
+                "alg": "ES256",
+                "kid": "test-key-id",
+            }
+            # Return wrong hash
+            mock_jwt.decode.return_value = {
+                "iat": time.time(),
+                "request_body_sha256": "wrong_hash_value",
+            }
+
+            with mock.patch.object(
+                self.controller,
+                "_get_webhook_verification_key",
+                return_value={"expired_at": None, "key": "fake-key"},
+            ):
+                headers = {"Plaid-Verification": "fake.jwt.token"}
+                result = self.controller._verify_plaid_webhook(
+                    body, headers, self.provider
+                )
+
+        self.assertFalse(result)
+
+    def test_webhook_verification_success(self):
+        """Test successful webhook verification"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+        body_hash = hashlib.sha256(body.encode()).hexdigest()
+
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", True), mock.patch(
+            _controller_class + ".jwt"
+        ) as mock_jwt:
+            mock_jwt.get_unverified_header.return_value = {
+                "alg": "ES256",
+                "kid": "test-key-id",
+            }
+            mock_jwt.decode.return_value = {
+                "iat": time.time(),  # Current time (valid)
+                "request_body_sha256": body_hash,  # Correct hash
+            }
+
+            with mock.patch.object(
+                self.controller,
+                "_get_webhook_verification_key",
+                return_value={"expired_at": None, "key": "fake-key"},
+            ):
+                headers = {"Plaid-Verification": "fake.jwt.token"}
+                result = self.controller._verify_plaid_webhook(
+                    body, headers, self.provider
+                )
+
+        self.assertTrue(result)
+
+    def test_webhook_verification_expired_key(self):
+        """Test that webhook is rejected when verification key has expired"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", True), mock.patch(
+            _controller_class + ".jwt"
+        ) as mock_jwt:
+            mock_jwt.get_unverified_header.return_value = {
+                "alg": "ES256",
+                "kid": "test-key-id",
+            }
+
+            # Key has expired_at set (not None means expired)
+            with mock.patch.object(
+                self.controller,
+                "_get_webhook_verification_key",
+                return_value={"expired_at": "2024-01-01T00:00:00Z", "key": "fake-key"},
+            ):
+                headers = {"Plaid-Verification": "fake.jwt.token"}
+                result = self.controller._verify_plaid_webhook(
+                    body, headers, self.provider
+                )
+
+        self.assertFalse(result)
+
+    def test_webhook_verification_skipped_when_jose_unavailable(self):
+        """Test that webhook verification is skipped when jose library is unavailable"""
+        body = '{"webhook_type": "TRANSACTIONS", "item_id": "test"}'
+        headers = {}  # No verification header needed
+
+        with mock.patch(_controller_class + ".JOSE_AVAILABLE", False):
+            result = self.controller._verify_plaid_webhook(body, headers, self.provider)
+
+        # Should return True (allow) when jose is unavailable
+        self.assertTrue(result)

@@ -38,10 +38,12 @@ class OnlineBankStatementProviderPlaid(models.Model):
     plaid_client_id = fields.Char(
         string="Client ID",
         help="Plaid API Client ID from your Plaid dashboard",
+        groups="base.group_system",
     )
     plaid_secret = fields.Char(
         string="Secret",
         help="Plaid API Secret from your Plaid dashboard",
+        groups="base.group_system",
     )
     plaid_environment = fields.Selection(
         selection=[
@@ -136,10 +138,7 @@ class OnlineBankStatementProviderPlaid(models.Model):
     @api.model
     def _get_available_services(self):
         """Register Plaid as an available service"""
-        services = super()._get_available_services()
-        if PLAID_AVAILABLE:
-            services = services + [("plaid", "Plaid")]
-        return services
+        return super()._get_available_services() + [("plaid", "Plaid")]
 
     def _get_plaid_client(self):
         """Get configured Plaid API client"""
